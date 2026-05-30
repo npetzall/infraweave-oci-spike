@@ -7,7 +7,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
   packages: write
 
 concurrency:
@@ -29,14 +28,11 @@ jobs:
       (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Setup ORAS
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3
 
       - name: Setup OpenTofu
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@847eaa4afeb791b06daa46e8eafa8b1b68d7cfb4
         with:
           tofu_version: 1.11.4
 
