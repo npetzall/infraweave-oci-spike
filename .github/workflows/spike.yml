@@ -133,11 +133,14 @@ jobs:
           oras pull "${GHCR_IMAGE}:${TAG_RUNNABLE}" -o work/out/pulled-runnable
           ls -la work/out/pulled-runnable
 
-      - name: OpenTofu init (module-only tag)
+      - name: OpenTofu init, validate, and apply (module-only tag)
         working-directory: ${{ env.SPIKE_ROOT }}
         run: |
-          mkdir -p work/out/tofu-test-module-only
-          cat > work/out/tofu-test-module-only/main.tf <<EOF
+          set -euo pipefail
+          TOFU_DIR=work/out/tofu-test-module-only
+
+          mkdir -p "$TOFU_DIR"
+          cat > "$TOFU_DIR/main.tf" <<EOF
           module "example" {
             source = "oci://${GHCR_IMAGE}?tag=${TAG_MODULE}"
 
@@ -149,13 +152,21 @@ jobs:
           }
           EOF
 
-          tofu -chdir=work/out/tofu-test-module-only init -input=false
+          tofu -chdir="$TOFU_DIR" init -input=false
+          tofu -chdir="$TOFU_DIR" validate
+          tofu -chdir="$TOFU_DIR" apply -auto-approve -input=false
 
-      - name: OpenTofu init (runnable tag as module)
+          VALUE="$(tofu -chdir="$TOFU_DIR" output -raw value)"
+          test "$VALUE" = "module-from-external-root"
+
+      - name: OpenTofu init, validate, and apply (runnable tag as module)
         working-directory: ${{ env.SPIKE_ROOT }}
         run: |
-          mkdir -p work/out/tofu-test-runnable-as-module
-          cat > work/out/tofu-test-runnable-as-module/main.tf <<EOF
+          set -euo pipefail
+          TOFU_DIR=work/out/tofu-test-runnable-as-module
+
+          mkdir -p "$TOFU_DIR"
+          cat > "$TOFU_DIR/main.tf" <<EOF
           module "example" {
             source = "oci://${GHCR_IMAGE}?tag=${TAG_RUNNABLE}"
 
@@ -167,7 +178,12 @@ jobs:
           }
           EOF
 
-          tofu -chdir=work/out/tofu-test-runnable-as-module init -input=false
+          tofu -chdir="$TOFU_DIR" init -input=false
+          tofu -chdir="$TOFU_DIR" validate
+          tofu -chdir="$TOFU_DIR" apply -auto-approve -input=false
+
+          VALUE="$(tofu -chdir="$TOFU_DIR" output -raw value)"
+          test "$VALUE" = "module-from-external-root"
 
       - name: Extract and run project layer (runner POC)
         working-directory: ${{ env.SPIKE_ROOT }}
