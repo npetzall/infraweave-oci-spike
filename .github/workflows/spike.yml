@@ -1,0 +1,207 @@
+# Self-contained spike: build OpenTofu OCI module artifacts with ORAS, push to GHCR, verify with pull + tofu init + project-layer run.
+# Intended to live at the repository root (e.g. a dedicated spike repo) as .github/workflows/spike.yml.
+
+name: Spike OCI image layout
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: spike-oci-image-layout-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SPIKE_ROOT: ${{ github.workspace }}
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/infraweave-oci-spike
+  TAG_MODULE: module-only
+  TAG_RUNNABLE: runnable
+
+jobs:
+  spike:
+    runs-on: ubuntu-latest
+    # GITHUB_TOKEN cannot publish packages on pull_request from forks.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.11.4
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Write module and project sources
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          rm -rf work
+          mkdir -p work/module-src work/project-src work/out
+
+          cat > work/module-src/variables.tf <<'EOF'
+          variable "input" {
+            type        = string
+            description = "String to prefix with module-"
+          }
+          EOF
+
+          cat > work/module-src/outputs.tf <<'EOF'
+          output "value" {
+            description = "Input string prefixed with module-"
+            value       = "module-${var.input}"
+          }
+          EOF
+
+          cat > work/project-src/main.tf <<EOF
+          terraform {
+            required_version = ">= 1.6.0"
+          }
+
+          module "module" {
+            source = "oci://${GHCR_IMAGE}?tag=${TAG_RUNNABLE}"
+
+            input = "called-from-project"
+          }
+          EOF
+
+          cat > work/project-src/outputs.tf <<'EOF'
+          output "value" {
+            description = "Value from the OCI module layer"
+            value       = module.module.value
+          }
+          EOF
+
+      - name: Build layer zips
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          (cd work/module-src && zip -r ../out/module-package.zip .)
+          (cd work/project-src && zip -r ../out/project-root.zip .)
+          unzip -l work/out/module-package.zip
+          unzip -l work/out/project-root.zip
+
+      - name: Push module-only image
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          oras push \
+            --artifact-type application/vnd.opentofu.modulepkg \
+            --export-manifest work/out/manifest-module-only.json \
+            "${GHCR_IMAGE}:${TAG_MODULE}" \
+            work/out/module-package.zip:archive/zip
+
+      - name: Push runnable image
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          oras push \
+            --artifact-type application/vnd.opentofu.modulepkg \
+            --export-manifest work/out/manifest-runnable.json \
+            "${GHCR_IMAGE}:${TAG_RUNNABLE}" \
+            work/out/module-package.zip:archive/zip \
+            work/out/project-root.zip:application/vnd.infraweave.project.v1+zip
+
+      - name: Verify manifests
+        run: |
+          oras manifest fetch "${GHCR_IMAGE}:${TAG_MODULE}" | jq -e '.artifactType == "application/vnd.opentofu.modulepkg"'
+          oras manifest fetch "${GHCR_IMAGE}:${TAG_MODULE}" | jq -e '(.layers | length) == 1'
+          oras manifest fetch "${GHCR_IMAGE}:${TAG_MODULE}" | jq -e '.layers[0].mediaType == "archive/zip"'
+
+          oras manifest fetch "${GHCR_IMAGE}:${TAG_RUNNABLE}" | jq -e '.artifactType == "application/vnd.opentofu.modulepkg"'
+          oras manifest fetch "${GHCR_IMAGE}:${TAG_RUNNABLE}" | jq -e '(.layers | length) == 2'
+          oras manifest fetch "${GHCR_IMAGE}:${TAG_RUNNABLE}" | jq -e '
+            ([.layers[].mediaType] | index("archive/zip")) != null and
+            ([.layers[].mediaType] | index("application/vnd.infraweave.project.v1+zip")) != null
+          '
+
+      - name: Pull module-only artifact
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          oras pull "${GHCR_IMAGE}:${TAG_MODULE}" -o work/out/pulled-module-only
+          test "$(find work/out/pulled-module-only -type f | wc -l)" -ge 1
+
+      - name: Pull runnable artifact
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          oras pull "${GHCR_IMAGE}:${TAG_RUNNABLE}" -o work/out/pulled-runnable
+          ls -la work/out/pulled-runnable
+
+      - name: OpenTofu init (module-only tag)
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          mkdir -p work/out/tofu-test-module-only
+          cat > work/out/tofu-test-module-only/main.tf <<EOF
+          module "example" {
+            source = "oci://${GHCR_IMAGE}?tag=${TAG_MODULE}"
+
+            input = "from-external-root"
+          }
+
+          output "value" {
+            value = module.example.value
+          }
+          EOF
+
+          tofu -chdir=work/out/tofu-test-module-only init -input=false
+
+      - name: OpenTofu init (runnable tag as module)
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          mkdir -p work/out/tofu-test-runnable-as-module
+          cat > work/out/tofu-test-runnable-as-module/main.tf <<EOF
+          module "example" {
+            source = "oci://${GHCR_IMAGE}?tag=${TAG_RUNNABLE}"
+
+            input = "from-external-root"
+          }
+
+          output "value" {
+            value = module.example.value
+          }
+          EOF
+
+          tofu -chdir=work/out/tofu-test-runnable-as-module init -input=false
+
+      - name: Extract and run project layer (runner POC)
+        working-directory: ${{ env.SPIKE_ROOT }}
+        run: |
+          set -euo pipefail
+          PROJECT_MEDIA_TYPE="application/vnd.infraweave.project.v1+zip"
+          RUNNER_DIR=work/out/runner-project
+
+          PROJECT_DIGEST="$(
+            oras manifest fetch "${GHCR_IMAGE}:${TAG_RUNNABLE}" | jq -er --arg mt "$PROJECT_MEDIA_TYPE" '
+              [.layers[] | select(.mediaType == $mt)] | if length != 1 then
+                error("expected exactly one project layer, got \(length)")
+              else .[0].digest end
+            '
+          )"
+
+          mkdir -p "$RUNNER_DIR/workspace"
+          oras blob fetch --output "$RUNNER_DIR/project-root.zip" "${GHCR_IMAGE}@${PROJECT_DIGEST}"
+          unzip -q "$RUNNER_DIR/project-root.zip" -d "$RUNNER_DIR/workspace"
+
+          tofu -chdir="$RUNNER_DIR/workspace" init -input=false
+          tofu -chdir="$RUNNER_DIR/workspace" apply -auto-approve -input=false
+
+          VALUE="$(tofu -chdir="$RUNNER_DIR/workspace" output -raw value)"
+          test "$VALUE" = "module-called-from-project"
+
+      - name: Upload spike artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-oci-image-layout-${{ github.run_id }}
+          path: work/out/
+          if-no-files-found: ignore
